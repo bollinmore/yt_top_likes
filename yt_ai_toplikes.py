@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
-import os, sys, argparse, time, math, csv
-from datetime import datetime, timedelta, timezone
+﻿#!/usr/bin/env python3
+import argparse
+import csv
+import os
+import sys
+import time
+
 import requests
 
 API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
@@ -8,7 +12,7 @@ API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 
-# 關鍵字：英文/中文常見 AI 相關詞彙
+# 預設的 AI 關鍵字（英文/中文）
 AI_QUERIES = [
     "AI",
     "artificial intelligence",
@@ -40,7 +44,9 @@ def configure_output_streams():
             except Exception:
                 pass
 
+
 configure_output_streams()
+
 
 def parse_yt_error(resp):
     """Return (message, reasons, payload_dict) for a YouTube API error response."""
@@ -96,16 +102,72 @@ def interpret_yt_http_error(resp, context):
             )
     return f"YouTube API request failed while {context}: {description}"
 
-def rfc3339_day_start(d):  # inclusive
-    return f"{d}T00:00:00Z"
 
-def rfc3339_day_end(d):  # inclusive end-of-day
-    return f"{d}T23:59:59Z"
+def safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def prepare_keyword_filters(raw_keywords):
+    normalized = []
+    lowered = []
+    if not raw_keywords:
+        return normalized, lowered
+    for kw in raw_keywords:
+        if kw is None:
+            continue
+        value = kw.strip()
+        if not value:
+            continue
+        normalized.append(value)
+        lowered.append(value.casefold())
+    return normalized, lowered
+
+
+def snippet_matches_keywords(snippet, lowered_keywords):
+    if not lowered_keywords:
+        return True
+    text_parts = []
+    title = snippet.get("title")
+    if title:
+        text_parts.append(title)
+    description = snippet.get("description")
+    if description:
+        text_parts.append(description)
+    tags = snippet.get("tags")
+    if isinstance(tags, list):
+        text_parts.extend(tag for tag in tags if tag)
+    if not text_parts:
+        return False
+    haystack = " ".join(text_parts).casefold()
+    return any(kw in haystack for kw in lowered_keywords)
+
+
+def build_video_row(video_id, snippet, statistics):
+    return {
+        "videoId": video_id or "",
+        "title": snippet.get("title", ""),
+        "channelTitle": snippet.get("channelTitle", ""),
+        "publishedAt": snippet.get("publishedAt", ""),
+        "likeCount": safe_int(statistics.get("likeCount")),
+        "viewCount": safe_int(statistics.get("viewCount")),
+        "commentCount": safe_int(statistics.get("commentCount")),
+    }
+
+
+def rfc3339_day_start(day_text):
+    return f"{day_text}T00:00:00Z"
+
+
+def rfc3339_day_end(day_text):
+    return f"{day_text}T23:59:59Z"
+
 
 def yt_search(api_key, query, published_after, published_before, max_total=300, sleep_sec=0.2):
     """
-    以 search.list 搜尋影片 ID（type=video），分頁直到達到上限或無更多頁。
-    注意：search.list 需要 part=snippet；使用 publishedAfter/publishedBefore 過濾日期；分頁用 pageToken。參見官方文件。 
+    Use search.list to collect video IDs (type=video) for a keyword within a publish window.
     """
     got = 0
     page_token = None
@@ -117,11 +179,9 @@ def yt_search(api_key, query, published_after, published_before, max_total=300, 
             "part": "snippet",
             "type": "video",
             "q": query,
-            "maxResults": 50,  # API 允許的上限
+            "maxResults": 50,
             "publishedAfter": published_after,
             "publishedBefore": published_before,
-            # 不以按讚排序，因為官方不提供；先蒐集候選清單，稍後用 videos.list 撈 likeCount 再排序
-            # 可選：加入 "safeSearch": "none"、"relevanceLanguage": "en" 等
         }
         if page_token:
             params["pageToken"] = page_token
@@ -154,17 +214,18 @@ def yt_search(api_key, query, published_after, published_before, max_total=300, 
         time.sleep(sleep_sec)
     return ids
 
+
 def chunked(seq, n):
     for i in range(0, len(seq), n):
-        yield seq[i:i+n]
+        yield seq[i : i + n]
+
 
 def yt_videos_stats(api_key, video_ids):
     """
-    用 videos.list 取得統計資料（statistics.likeCount）與標題/頻道/發布日等（part=snippet,statistics）。
-    官方說明：likeCount 在 statistics 物件中，若影片關閉評分可能缺值。 
+    Retrieve snippet/statistics for video ids via videos.list.
     """
     results = {}
-    for batch in chunked(video_ids, 50):  # videos.list 單次最多 50 IDs
+    for batch in chunked(video_ids, 50):
         params = {
             "key": api_key,
             "part": "snippet,statistics",
@@ -176,7 +237,8 @@ def yt_videos_stats(api_key, video_ids):
         except requests.HTTPError as exc:
             context = (
                 f"fetching video stats (batch starting with {batch[0]})"
-                if batch else "fetching video stats"
+                if batch
+                else "fetching video stats"
             )
             error_msg = interpret_yt_http_error(resp, context)
             raise YoutubeAPIError(error_msg) from exc
@@ -190,46 +252,270 @@ def yt_videos_stats(api_key, video_ids):
             vid = it.get("id")
             snippet = it.get("snippet", {})
             stats = it.get("statistics", {})
-            # 某些影片可能無 likeCount（關閉評分），以 0 代替
-            like = int(stats.get("likeCount", 0)) if stats.get("likeCount") is not None else 0
-            results[vid] = {
-                "videoId": vid,
-                "title": snippet.get("title", ""),
-                "channelTitle": snippet.get("channelTitle", ""),
-                "publishedAt": snippet.get("publishedAt", ""),
-                "likeCount": like,
-                "viewCount": int(stats.get("viewCount", 0)) if stats.get("viewCount") is not None else 0,
-                "commentCount": int(stats.get("commentCount", 0)) if stats.get("commentCount") is not None else 0,
-            }
+            results[vid] = build_video_row(vid, snippet, stats)
     return results
 
+
+def fetch_most_liked_videos(
+    api_key,
+    *,
+    region_code,
+    pool_limit,
+    keywords_lower=None,
+    video_category_id=None,
+    sleep_sec=0.2,
+):
+    """
+    Pull a slice of the mostPopular feed and keep the entries that match the keyword filter.
+    """
+    if pool_limit <= 0:
+        return [], {
+            "requests": 0,
+            "examined": 0,
+            "region": (region_code or "").upper(),
+            "pool_limit": 0,
+            "categoryId": video_category_id,
+        }
+
+    pool_limit = min(max(pool_limit, 1), 200)
+    keywords_lower = keywords_lower or []
+
+    region = (region_code or "").strip()
+    if not region and not video_category_id:
+        raise YoutubeAPIError(
+            "Region code or video category id must be provided for most-liked mode."
+        )
+
+    results = []
+    seen_ids = set()
+    page_token = None
+    requests_made = 0
+
+    while len(seen_ids) < pool_limit:
+        remaining = pool_limit - len(seen_ids)
+        batch_size = min(50, remaining)
+        params = {
+            "key": api_key,
+            "part": "snippet,statistics",
+            "chart": "mostPopular",
+            "maxResults": batch_size,
+        }
+        if region:
+            params["regionCode"] = region
+        if video_category_id:
+            params["videoCategoryId"] = video_category_id
+        if page_token:
+            params["pageToken"] = page_token
+
+        try:
+            resp = requests.get(VIDEOS_URL, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            context_bits = ["fetching most liked videos"]
+            if region:
+                context_bits.append(f"region {region.upper()}")
+            if video_category_id:
+                context_bits.append(f"category {video_category_id}")
+            error_msg = interpret_yt_http_error(resp, " ".join(context_bits))
+            raise YoutubeAPIError(error_msg) from exc
+        except requests.RequestException as exc:
+            raise YoutubeAPIError(
+                f"Network error while retrieving most liked videos: {exc}"
+            ) from exc
+
+        requests_made += 1
+        data = resp.json()
+        for item in data.get("items", []):
+            vid = item.get("id")
+            if not vid or vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+            snippet = item.get("snippet", {})
+            if keywords_lower and not snippet_matches_keywords(snippet, keywords_lower):
+                continue
+            stats = item.get("statistics", {})
+            results.append(build_video_row(vid, snippet, stats))
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+        time.sleep(sleep_sec)
+
+    meta = {
+        "requests": requests_made,
+        "examined": len(seen_ids),
+        "region": region.upper() if region else "",
+        "pool_limit": pool_limit,
+        "categoryId": video_category_id,
+    }
+    return results, meta
+
+
+def print_top_videos(rows, title):
+    print(f"\n{title}\n")
+    print(f"{'Rank':<4} {'Likes':>8} {'Views':>10}  {'PublishedAt':<20}  {'Channel':<30}  Title")
+    for idx, row in enumerate(rows, 1):
+        print(
+            f"{idx:<4} {row['likeCount']:>8} {row['viewCount']:>10}  "
+            f"{row['publishedAt']:<20}  {row['channelTitle']:<30}  "
+            f"{row['title']}  https://youtu.be/{row['videoId']}"
+        )
+
+
+def write_csv_output(path, rows):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "rank",
+                "videoId",
+                "title",
+                "channelTitle",
+                "publishedAt",
+                "likeCount",
+                "viewCount",
+                "commentCount",
+                "url",
+            ]
+        )
+        for idx, row in enumerate(rows, 1):
+            writer.writerow(
+                [
+                    idx,
+                    row["videoId"],
+                    row["title"],
+                    row["channelTitle"],
+                    row["publishedAt"],
+                    row["likeCount"],
+                    row["viewCount"],
+                    row["commentCount"],
+                    f"https://youtu.be/{row['videoId']}",
+                ]
+            )
+    print(f"\nCSV exported to {path}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Find top-liked AI-related YouTube videos in 2025/09 mid.")
-    parser.add_argument("--api-key", default=None, help="YouTube Data API key (default from env YOUTUBE_API_KEY)")
+    parser = argparse.ArgumentParser(
+        description="Find top-liked AI-related YouTube videos."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("windowed", "most-liked"),
+        default="windowed",
+        help="Choose between date-window search and direct most-liked retrieval.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="YouTube Data API key (default from env YOUTUBE_API_KEY)",
+    )
     parser.add_argument("--start", default="2025-09-10", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", default="2025-09-20", help="End date (YYYY-MM-DD)")
-    parser.add_argument("--max-per-query", type=int, default=300, help="Max items to fetch per keyword query")
+    parser.add_argument(
+        "--max-per-query",
+        type=int,
+        default=300,
+        help="Max items to fetch per keyword query (windowed mode).",
+    )
     parser.add_argument("--csv", default=None, help="Output CSV path")
+    parser.add_argument(
+        "--keywords",
+        nargs="+",
+        default=None,
+        help="Override the default AI keyword list.",
+    )
+    parser.add_argument(
+        "--region",
+        default="US",
+        help="ISO 3166-1 alpha-2 region code used in most-liked mode.",
+    )
+    parser.add_argument(
+        "--most-liked-pool",
+        type=int,
+        default=120,
+        help="Number of trending videos to inspect in most-liked mode (<=200).",
+    )
+    parser.add_argument(
+        "--category-id",
+        default=None,
+        help="Optional videoCategoryId for most-liked mode.",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="Number of top videos to display and export.",
+    )
     args = parser.parse_args()
 
     api_key = args.api_key or API_KEY
     if not api_key:
-        print("ERROR: Please provide API key via --api-key or env YOUTUBE_API_KEY", file=sys.stderr)
+        print(
+            "ERROR: Please provide API key via --api-key or env YOUTUBE_API_KEY",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    # 日期轉 RFC3339（YouTube API 需要）
+    keywords, keywords_lower = prepare_keyword_filters(args.keywords or AI_QUERIES)
+    top_limit = max(1, args.top)
+
+    if args.mode == "most-liked":
+        pool_limit = max(args.most_liked_pool, top_limit * 2)
+        try:
+            rows, meta = fetch_most_liked_videos(
+                api_key,
+                region_code=args.region,
+                pool_limit=pool_limit,
+                keywords_lower=keywords_lower,
+                video_category_id=args.category_id,
+            )
+        except YoutubeAPIError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+        if not rows:
+            print(
+                "No videos matched the provided keywords in the most-liked feed. "
+                "Increase --most-liked-pool or adjust --keywords."
+            )
+            return
+
+        rows.sort(key=lambda r: r["likeCount"], reverse=True)
+        top_rows = rows[:top_limit]
+
+        print(
+            f"Inspected {meta['examined']} trending videos (pool limit {meta['pool_limit']}) "
+            f"across {meta['requests']} API call(s); {len(rows)} matched the keyword filter."
+        )
+        if meta["categoryId"]:
+            print(f"Restricted to category {meta['categoryId']}.")
+        label_region = meta["region"] or "unspecified region"
+        label = (
+            f"Top {top_limit} videos by likes (most-liked mode, region {label_region})"
+        )
+        print_top_videos(top_rows, label)
+        if args.csv:
+            write_csv_output(args.csv, top_rows)
+        return
+
+    # windowed mode
     start_iso = rfc3339_day_start(args.start)
     end_iso = rfc3339_day_end(args.end)
 
-    # 逐個關鍵字蒐集候選影片
     all_ids = set()
     query_results = {}
     query_errors = []
     blocked = False
 
-    for q in AI_QUERIES:
+    for q in keywords:
         try:
-            ids = yt_search(api_key, q, start_iso, end_iso, max_total=args.max_per_query)
+            ids = yt_search(
+                api_key, q, start_iso, end_iso, max_total=args.max_per_query
+            )
         except YoutubeAPIError as exc:
             message = str(exc)
             query_errors.append((q, message))
@@ -245,16 +531,21 @@ def main():
 
     if not all_ids:
         if query_errors:
-            print("ERROR: Unable to fetch video IDs for the requested window.", file=sys.stderr)
+            print(
+                "ERROR: Unable to fetch video IDs for the requested window.",
+                file=sys.stderr,
+            )
             for q, err in query_errors:
                 print(f"  - {q}: {err}", file=sys.stderr)
             if blocked:
-                print("Hint: Provide a fresh API key or wait for the quota to reset.", file=sys.stderr)
+                print(
+                    "Hint: Provide a fresh API key or wait for the quota to reset.",
+                    file=sys.stderr,
+                )
             sys.exit(2)
         print("No videos found in the specified window/queries.")
         return
 
-    # 撈取影片統計（含 likeCount），並排序
     try:
         stats_map = yt_videos_stats(api_key, list(all_ids))
     except YoutubeAPIError as exc:
@@ -263,7 +554,7 @@ def main():
 
     rows = list(stats_map.values())
     rows.sort(key=lambda r: r["likeCount"], reverse=True)
-    top10 = rows[:10]
+    top_rows = rows[:top_limit]
 
     successful_queries = len(query_results)
     queries_with_hits = sum(1 for count in query_results.values() if count)
@@ -271,32 +562,26 @@ def main():
         f"Collected {len(all_ids)} unique video IDs from {successful_queries} keyword searches "
         f"({queries_with_hits} returned matches)."
     )
-
     if query_errors:
-        print("\nWARNING: Some keyword searches failed and results may be incomplete:", file=sys.stderr)
+        print(
+            "\nWARNING: Some keyword searches failed and results may be incomplete:",
+            file=sys.stderr,
+        )
         for q, err in query_errors:
             print(f"  - {q}: {err}", file=sys.stderr)
         if blocked:
-            print("Quota-related failure detected; output only covers successful searches.", file=sys.stderr)
+            print(
+                "Quota-related failure detected; output only covers successful searches.",
+                file=sys.stderr,
+            )
 
+    date_label = f"{args.start} to {args.end}"
+    label = f"Top {top_limit} videos by likes (windowed mode, {date_label})"
+    print_top_videos(top_rows, label)
 
-    # 輸出結果（表格）
-    print("\nTop 10 AI-related videos by likes (2025-09-10 to 2025-09-20)\n")
-    print(f"{'Rank':<4} {'Likes':>8} {'Views':>10}  {'PublishedAt':<20}  {'Channel':<30}  Title")
-    for i, r in enumerate(top10, 1):
-        print(f"{i:<4} {r['likeCount']:>8} {r['viewCount']:>10}  {r['publishedAt']:<20}  {r['channelTitle']:<30}  {r['title']}  https://youtu.be/{r['videoId']}")
-
-    # 輸出 CSV（可選）
     if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["rank","videoId","title","channelTitle","publishedAt","likeCount","viewCount","commentCount","url"])
-            for i, r in enumerate(top10, 1):
-                writer.writerow([
-                    i, r["videoId"], r["title"], r["channelTitle"], r["publishedAt"],
-                    r["likeCount"], r["viewCount"], r["commentCount"], f"https://youtu.be/{r['videoId']}"
-                ])
-        print(f"\nCSV 已輸出：{args.csv}")
+        write_csv_output(args.csv, top_rows)
+
 
 if __name__ == "__main__":
     main()
