@@ -22,6 +22,80 @@ AI_QUERIES = [
     "深度學習",
 ]
 
+
+class YoutubeAPIError(Exception):
+    """Raised when the YouTube Data API returns an error response."""
+
+
+def configure_output_streams():
+    """Allow printing of non-ASCII characters even on narrow Windows code pages."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        reconfig = getattr(stream, "reconfigure", None)
+        if callable(reconfig):
+            try:
+                stream.reconfigure(errors="backslashreplace")
+            except Exception:
+                pass
+
+configure_output_streams()
+
+def parse_yt_error(resp):
+    """Return (message, reasons, payload_dict) for a YouTube API error response."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, [], None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or ""
+        reasons = []
+        for entry in error.get("errors", []):
+            reason = entry.get("reason")
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        return message, reasons, payload
+    return None, [], payload
+
+
+def describe_yt_error(resp):
+    message, reasons, payload = parse_yt_error(resp)
+    if message:
+        if reasons:
+            return f"{message} (reason: {', '.join(reasons)})"
+        return message
+    if payload is not None:
+        return str(payload)
+    return f"{resp.status_code} {resp.reason}"
+
+
+def interpret_yt_http_error(resp, context):
+    """Build a friendly error message for failed YouTube Data API requests."""
+    message, reasons, payload = parse_yt_error(resp)
+    if message:
+        if reasons:
+            description = f"{message} (reason: {', '.join(reasons)})"
+        else:
+            description = message
+    elif payload is not None:
+        description = str(payload)
+    else:
+        description = f"{resp.status_code} {resp.reason}"
+
+    reason_set = set(reasons)
+    if resp.status_code == 403:
+        if reason_set.intersection({"quotaExceeded", "dailyLimitExceeded"}):
+            return (
+                f"YouTube API quota exceeded while {context}. Wait for the daily reset or use a different API key."
+            )
+        if reason_set.intersection({"rateLimitExceeded", "userRateLimitExceeded"}):
+            return (
+                f"YouTube API rate limit hit while {context}. Reduce request volume or retry later."
+            )
+    return f"YouTube API request failed while {context}: {description}"
+
 def rfc3339_day_start(d):  # inclusive
     return f"{d}T00:00:00Z"
 
@@ -52,8 +126,16 @@ def yt_search(api_key, query, published_after, published_before, max_total=300, 
         if page_token:
             params["pageToken"] = page_token
 
-        resp = requests.get(SEARCH_URL, params=params, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp = requests.get(SEARCH_URL, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            error_msg = interpret_yt_http_error(resp, f"searching for query '{query}'")
+            raise YoutubeAPIError(error_msg) from exc
+        except requests.RequestException as exc:
+            raise YoutubeAPIError(
+                f"Network error during YouTube search for query '{query}': {exc}"
+            ) from exc
         data = resp.json()
 
         items = data.get("items", [])
@@ -88,8 +170,21 @@ def yt_videos_stats(api_key, video_ids):
             "part": "snippet,statistics",
             "id": ",".join(batch),
         }
-        resp = requests.get(VIDEOS_URL, params=params, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp = requests.get(VIDEOS_URL, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            context = (
+                f"fetching video stats (batch starting with {batch[0]})"
+                if batch else "fetching video stats"
+            )
+            error_msg = interpret_yt_http_error(resp, context)
+            raise YoutubeAPIError(error_msg) from exc
+        except requests.RequestException as exc:
+            first_id = batch[0] if batch else ""
+            raise YoutubeAPIError(
+                f"Network error while fetching video stats for batch starting with {first_id}: {exc}"
+            ) from exc
         data = resp.json()
         for it in data.get("items", []):
             vid = it.get("id")
@@ -128,20 +223,62 @@ def main():
 
     # 逐個關鍵字蒐集候選影片
     all_ids = set()
+    query_results = {}
+    query_errors = []
+    blocked = False
+
     for q in AI_QUERIES:
-        ids = yt_search(api_key, q, start_iso, end_iso, max_total=args.max_per_query)
+        try:
+            ids = yt_search(api_key, q, start_iso, end_iso, max_total=args.max_per_query)
+        except YoutubeAPIError as exc:
+            message = str(exc)
+            query_errors.append((q, message))
+            lower_msg = message.lower()
+            if "quota exceeded" in lower_msg or "rate limit hit" in lower_msg:
+                blocked = True
+                break
+            continue
+
+        query_results[q] = len(ids)
         for vid in ids:
             all_ids.add(vid)
 
     if not all_ids:
+        if query_errors:
+            print("ERROR: Unable to fetch video IDs for the requested window.", file=sys.stderr)
+            for q, err in query_errors:
+                print(f"  - {q}: {err}", file=sys.stderr)
+            if blocked:
+                print("Hint: Provide a fresh API key or wait for the quota to reset.", file=sys.stderr)
+            sys.exit(2)
         print("No videos found in the specified window/queries.")
         return
 
     # 撈取影片統計（含 likeCount），並排序
-    stats_map = yt_videos_stats(api_key, list(all_ids))
+    try:
+        stats_map = yt_videos_stats(api_key, list(all_ids))
+    except YoutubeAPIError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     rows = list(stats_map.values())
     rows.sort(key=lambda r: r["likeCount"], reverse=True)
     top10 = rows[:10]
+
+    successful_queries = len(query_results)
+    queries_with_hits = sum(1 for count in query_results.values() if count)
+    print(
+        f"Collected {len(all_ids)} unique video IDs from {successful_queries} keyword searches "
+        f"({queries_with_hits} returned matches)."
+    )
+
+    if query_errors:
+        print("\nWARNING: Some keyword searches failed and results may be incomplete:", file=sys.stderr)
+        for q, err in query_errors:
+            print(f"  - {q}: {err}", file=sys.stderr)
+        if blocked:
+            print("Quota-related failure detected; output only covers successful searches.", file=sys.stderr)
+
 
     # 輸出結果（表格）
     print("\nTop 10 AI-related videos by likes (2025-09-10 to 2025-09-20)\n")
